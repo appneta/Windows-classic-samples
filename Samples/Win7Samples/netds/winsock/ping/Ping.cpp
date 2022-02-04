@@ -71,7 +71,11 @@ BOOL  bRecordRoute=FALSE;               // Use IPv4 record route?
 char *gDestination=NULL,                // Destination
       recvbuf[MAX_RECV_BUF_LEN];        // For received packets
 int   recvbuflen = MAX_RECV_BUF_LEN;    // Length of received packets.
-
+int   gPmtuDiscover = -1;
+char  gPort[] = "0";
+BOOL  bHeaderInclude = FALSE;
+BOOL  bDontFrag = FALSE;
+BOOL  bForceIPv6 = FALSE;
 
 //
 // Function: usage
@@ -88,6 +92,10 @@ void usage(char *progname)
     printf("            -i ttl       Time to live (default: 128) \n");
     printf("            -l bytes     Amount of data to send (default: 32) \n");
     printf("            -r           Record route (IPv4 only)\n");
+    printf("            -d           Set Don't Fragment legacy socket option\n");
+    printf("            -6           Force IPv6 socket() protocol - sets Header Include (-o)\n");
+    printf("            -o           Set Header Include socket option (IPv6 only for now))\n");
+    printf("            -m           PMTU discover (\"do\", \"dont\" or \"probe\"\n");
 
     return;
 }
@@ -145,6 +153,22 @@ int InitIcmp6Header(char *buf, int datasize)
     memset(datapart, '#', datasize);
 
     return (sizeof(ICMPV6_HDR) + sizeof(ICMPV6_ECHO_REQUEST));
+}
+
+void InitIPv6Header(char *buf, int size,  SOCKADDR_IN6 *localif, SOCKADDR_IN6 *dest)
+{
+    struct ipv6_hdr *ipv6_hdr = (struct ipv6_hdr*)buf;
+
+    if (!bHeaderInclude)
+        return;
+
+    memset(ipv6_hdr, 0, sizeof(*ipv6_hdr));
+    ipv6_hdr->ipv6_vertcflow = htonl(6 << 28);
+    ipv6_hdr->ipv6_payloadlen = htons(size);
+    ipv6_hdr->ipv6_hoplimit = gTtl;
+    ipv6_hdr->ipv6_nexthdr = IPPROTO_ICMP6;
+    memcpy(&ipv6_hdr->ipv6_srcaddr, &localif->sin6_addr, sizeof(ipv6_hdr->ipv6_srcaddr));
+    memcpy(&ipv6_hdr->ipv6_destaddr, &dest->sin6_addr, sizeof(ipv6_hdr->ipv6_destaddr));
 }
 
 // 
@@ -228,6 +252,30 @@ BOOL ValidateArgs(int argc, char **argv)
                 case 'r':        // record route option
                     bRecordRoute = TRUE;
                     break;
+                case 'd':        // don't frag option
+                    bDontFrag = TRUE;
+                    break;
+                case 'o':        // IP Header Include option
+                    bHeaderInclude = TRUE;
+                    break;
+                case '6':        // force IPv6 protocol in socket() call (sets HDRINCL)
+                    bForceIPv6 = TRUE;
+                    bHeaderInclude = TRUE;
+                    break;
+                case 'm':
+                    if (!strcmp("do", argv[i+1]))
+                        gPmtuDiscover = IP_PMTUDISC_DO;
+                    else if (!strcmp("dont", argv[i+1]))
+                        gPmtuDiscover = IP_PMTUDISC_DONT;
+                    else if (!strcmp("probe", argv[i+1]))
+                        gPmtuDiscover = IP_PMTUDISC_PROBE;
+                    else
+                    {
+                        usage(argv[0]);
+                        goto CLEANUP;
+                    }
+                    ++i;
+                    break;
                 default:
                     usage(argv[0]);
                     goto CLEANUP;
@@ -287,7 +335,7 @@ void SetIcmpSequence(char *buf)
 //    To do this we call the SIO_ROUTING_INTERFACE_QUERY ioctl to find which
 //    local interface for the outgoing packet.
 //
-USHORT ComputeIcmp6PseudoHeaderChecksum(SOCKET s, char *icmppacket, int icmplen, struct addrinfo *dest)
+USHORT ComputeIcmp6PseudoHeaderChecksum(SOCKET s, char *ip, char *icmppacket, int icmplen, struct addrinfo *dest)
 {
     SOCKADDR_STORAGE localif;
     DWORD            bytes;
@@ -314,6 +362,11 @@ USHORT ComputeIcmp6PseudoHeaderChecksum(SOCKET s, char *icmppacket, int icmplen,
         return 0xFFFF;
     }
 
+    // if header include, init the header
+    if (bHeaderInclude) {
+        // IPv6 only for now
+        InitIPv6Header(ip, icmplen, (SOCKADDR_IN6 *)&localif, (SOCKADDR_IN6 *)dest->ai_addr);
+    }
     // We use a temporary buffer to calculate the pseudo header. 
     ptr = tmp;
     total = 0;
@@ -388,25 +441,26 @@ USHORT ComputeIcmp6PseudoHeaderChecksum(SOCKET s, char *icmppacket, int icmplen,
 //    header which is difficult since we aren't building our own IPv6
 //    header.
 //
-void ComputeIcmpChecksum(SOCKET s, char *buf, int packetlen, struct addrinfo *dest)
+void ComputeIcmpChecksum(SOCKET s, char *ip, char *icmp, int packetlen, struct addrinfo *dest)
 {
     if (gAddressFamily == AF_INET)
     {
         ICMP_HDR    *icmpv4=NULL;
 
-        icmpv4 = (ICMP_HDR *)buf;
+        icmpv4 = (ICMP_HDR *)icmp;
         icmpv4->icmp_checksum = 0;
-        icmpv4->icmp_checksum = checksum((USHORT *)buf, packetlen);
+        icmpv4->icmp_checksum = checksum((USHORT *)icmp, packetlen);
     }
     else if (gAddressFamily == AF_INET6)
     {
         ICMPV6_HDR  *icmpv6=NULL;
 
-        icmpv6 = (ICMPV6_HDR *)buf;
+        icmpv6 = (ICMPV6_HDR *)icmp;
         icmpv6->icmp6_checksum = 0;
         icmpv6->icmp6_checksum = ComputeIcmp6PseudoHeaderChecksum(
                 s,
-                buf,
+                ip,
+                icmp,
                 packetlen,
                 dest
                 );
@@ -551,7 +605,105 @@ int SetTtl(SOCKET s, int ttl)
     }
     return rc;
 }
-        
+
+int SetPmtu(SOCKET s)
+{
+    int rc;
+
+    if (gPmtuDiscover == -1)
+        return 0;
+
+    if ((rc = setsockopt(s,
+                         (gAddressFamily == AF_INET6) ? IPPROTO_IPV6 : IPPROTO_IP,
+                         (gAddressFamily == AF_INET6) ? IPV6_MTU_DISCOVER : IP_MTU_DISCOVER,
+                         reinterpret_cast<char *>(&gPmtuDiscover),
+                         sizeof(gPmtuDiscover))) == SOCKET_ERROR)
+    {
+        fprintf(stderr, "SetPmtu: setsockopt failed: %d\n", WSAGetLastError());
+    }
+
+    return rc;
+}
+
+int SetDontFrag(SOCKET s)
+{
+    int val = 1;
+    int optlevel;
+    int option;
+    int rc;
+
+    if (!bDontFrag)
+        return 0;
+
+    if (gAddressFamily == AF_INET) {
+        optlevel = IPPROTO_IP;
+        option   = IP_DONTFRAGMENT;
+    }
+    else if (gAddressFamily == AF_INET6)
+    {
+        optlevel = IPPROTO_IPV6;
+        option   = IPV6_UNICAST_HOPS;
+    }
+    else
+    {
+        rc = SOCKET_ERROR;
+    }
+
+    if ((rc = setsockopt(s,
+                         optlevel,
+                         option,
+                         reinterpret_cast<char *>(&val),
+                         sizeof(val))) == SOCKET_ERROR)
+    {
+        fprintf(stderr, "SetDontFrag: setsockopt failed: %d\n", WSAGetLastError());
+        exit(-1);
+    }
+
+    return rc;
+}
+
+int SetIpHeaderInclude(SOCKET s)
+{
+    int val = 1;
+    int optlevel;
+    int option;
+    int rc;
+
+    if (!bHeaderInclude)
+        return 0;
+
+    if (gAddressFamily == AF_INET) {
+        fprintf(stderr, "SetIpHeaderInclude: Only IPv6 supported for now\n");
+        exit(-1);
+    }
+
+    if (gAddressFamily == AF_INET) {
+        optlevel = IPPROTO_IP;
+        option   = IP_HDRINCL;
+    }
+    else if (gAddressFamily == AF_INET6)
+    {
+        optlevel = IPPROTO_IPV6;
+        option   = IPV6_HDRINCL;
+    }
+    else
+    {
+        rc = SOCKET_ERROR;
+    }
+
+    if ((rc = setsockopt(s,
+                         optlevel,
+                         option,
+                         reinterpret_cast<char *>(&val),
+                         sizeof(val))) == SOCKET_ERROR)
+    {
+        fprintf(stderr, "SetIpHeaderInclude: setsockopt failed: %d\n", WSAGetLastError());
+        exit(-1);
+    }
+
+    return rc;
+}
+
 //
 // Function: main
 //
@@ -571,6 +723,8 @@ int __cdecl main(int argc, char **argv)
     WSAOVERLAPPED      recvol;
     SOCKET             s=INVALID_SOCKET;
     char              *icmpbuf=NULL;
+    char              *buf = NULL;
+    char              *ip = NULL;
     struct addrinfo   *dest=NULL,
                       *local=NULL;
     IPV4_OPTION_HDR    ipopt;
@@ -578,6 +732,7 @@ int __cdecl main(int argc, char **argv)
     DWORD              bytes,
                        flags;
     int                packetlen=0,
+                       iphlen = 0,
                        fromlen,
                        time=0,
                        rc,
@@ -605,7 +760,7 @@ int __cdecl main(int argc, char **argv)
     // Resolve the destination address
     dest = ResolveAddress(
             gDestination,
-            "0",
+            gPort,
             gAddressFamily,
             0,
             0
@@ -618,15 +773,19 @@ int __cdecl main(int argc, char **argv)
     }
     gAddressFamily = dest->ai_family;
 
-    if (gAddressFamily == AF_INET)
+    if (gAddressFamily == AF_INET) {
         gProtocol = IPPROTO_ICMP;
-    else if (gAddressFamily == AF_INET6)
-        gProtocol = IPPROTO_ICMP6;
+    } else if (gAddressFamily == AF_INET6) {
+        if (bForceIPv6)
+            gProtocol = IPPROTO_IPV6;
+        else
+            gProtocol = IPPROTO_ICMP6;
+    }
 
     // Get the bind address
     local = ResolveAddress(
             NULL,
-            "0",
+            gPort,
             gAddressFamily,
             0,
             0
@@ -648,6 +807,9 @@ int __cdecl main(int argc, char **argv)
     }
 
     SetTtl(s, gTtl);
+    SetPmtu(s);
+    SetDontFrag(s);
+    SetIpHeaderInclude(s);
 
     // Figure out the size of the ICMP header and payload
     if (gAddressFamily == AF_INET)
@@ -657,15 +819,19 @@ int __cdecl main(int argc, char **argv)
 
     // Add in the data size
     packetlen += gDataSize;
+    iphlen = bHeaderInclude ? ((gAddressFamily == AF_INET6) ? sizeof(ipv6_hdr) :  sizeof(ip_hdr)) : 0;
 
     // Allocate the buffer that will contain the ICMP request
-    icmpbuf = (char *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, packetlen);
-    if (icmpbuf == NULL)
+    buf = (char *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, iphlen + packetlen);
+    if (buf == NULL)
     {
         fprintf(stderr, "HeapAlloc failed: %d\n", GetLastError());
         status = -1;
         goto CLEANUP;
     }
+
+    ip = buf;
+    icmpbuf = ip + iphlen;
 
     // Initialize the ICMP headers
     if (gAddressFamily == AF_INET)
@@ -727,13 +893,13 @@ int __cdecl main(int argc, char **argv)
     {
         // Set the sequence number and compute the checksum
         SetIcmpSequence(icmpbuf);
-        ComputeIcmpChecksum(s, icmpbuf, packetlen, dest);
+        ComputeIcmpChecksum(s, ip, icmpbuf, packetlen, dest);
 
         time = GetTickCount();
         rc = sendto(
                 s,
-                icmpbuf,
-                packetlen,
+                ip,
+                packetlen + iphlen,
                 0,
                 dest->ai_addr,
                 (int)dest->ai_addrlen
@@ -805,8 +971,8 @@ CLEANUP:
         closesocket(s);
     if (recvol.hEvent != WSA_INVALID_EVENT)
         WSACloseEvent(recvol.hEvent);
-    if (icmpbuf)
-        HeapFree(GetProcessHeap(), 0, icmpbuf);
+    if (buf)
+        HeapFree(GetProcessHeap(), 0, buf);
 
     WSACleanup();
 
